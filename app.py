@@ -15,11 +15,6 @@ STATS_PATH = os.path.join(MODEL_DIR, 'model_stats.json')
 
 app = Flask(__name__)
 
-# ─────────────────────────────────────────────
-# AUTO-TRAIN FUNCTION
-# Agar .pkl files nahi hain toh yeh function
-# dataset se model train karke save karega
-# ─────────────────────────────────────────────
 def train_and_save_models():
     print("=" * 50)
     print("MODEL FILES NAHI MILE — AUTO TRAINING SHURU...")
@@ -27,7 +22,9 @@ def train_and_save_models():
 
     from sklearn.ensemble import GradientBoostingClassifier, IsolationForest
     from sklearn.preprocessing import StandardScaler
-    from sklearn.metrics import roc_auc_score
+    from sklearn.metrics import (roc_auc_score, confusion_matrix,
+        precision_score, recall_score, f1_score,
+        average_precision_score, precision_recall_curve, roc_curve)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -63,15 +60,38 @@ def train_and_save_models():
 
     print(f"ROC-AUC: {auc:.4f}")
 
-    # Model stats save karo
+    cm               = confusion_matrix(y, preds).tolist()
+    fpr_l, tpr_l, _  = roc_curve(y, probs)
+    pr_p, pr_r, _    = precision_recall_curve(y, probs)
+    fi = sorted(zip(X.columns, gb.feature_importances_),
+                key=lambda x: x[1], reverse=True)
+
+    def downsample(lst, n=200):
+        lst = list(lst)
+        if len(lst) <= n:
+            return [round(float(v), 6) for v in lst]
+        step = max(1, len(lst) // n)
+        return [round(float(lst[i]), 6) for i in range(0, len(lst), step)]
+
     stats = {
-        "roc_auc":         round(auc * 100, 2),
+        "roc_auc":            round(auc, 4),
         "total_transactions": int(len(df)),
-        "fraud_count":     int(y.sum()),
-        "normal_count":    int((y == 0).sum()),
-        "fraud_pct":       round(float(y.mean()) * 100, 2),
-        "model":           "Gradient Boosting + Isolation Forest",
-        "features":        list(X.columns)
+        "total_fraud":        int(y.sum()),
+        "total_normal":       int((y == 0).sum()),
+        "fraud_pct":          round(float(y.mean()) * 100, 2),
+        "precision":          round(precision_score(y, preds), 4),
+        "recall":             round(recall_score(y, preds), 4),
+        "f1_score":           round(f1_score(y, preds), 4),
+        "avg_precision":      round(average_precision_score(y, probs), 4),
+        "true_positives":     int(cm[1][1]),
+        "confusion_matrix":   cm,
+        "roc_curve":          {"fpr": downsample(fpr_l), "tpr": downsample(tpr_l)},
+        "pr_curve":           {"precision": downsample(pr_p), "recall": downsample(pr_r)},
+        "feature_importance": [[k, round(float(v), 6)] for k, v in fi],
+        "amount_stats": {
+            "fraud_mean":  round(float(df[y == 1]['Amount'].mean()), 4),
+            "normal_mean": round(float(df[y == 0]['Amount'].mean()), 4),
+        }
     }
 
     print("Models save ho rahe hain...")
@@ -86,9 +106,6 @@ def train_and_save_models():
     print("=" * 50)
 
 
-# ─────────────────────────────────────────────
-# CHECK KARO — FILES HAIN YA NAHI
-# ─────────────────────────────────────────────
 gb_path  = os.path.join(MODEL_DIR, 'gb_model.pkl')
 iso_path = os.path.join(MODEL_DIR, 'iso_forest.pkl')
 sc_path  = os.path.join(MODEL_DIR, 'scaler.pkl')
@@ -96,12 +113,19 @@ sc_path  = os.path.join(MODEL_DIR, 'scaler.pkl')
 if not (os.path.exists(gb_path) and os.path.exists(iso_path) and os.path.exists(sc_path)):
     train_and_save_models()
 else:
-    print("Model files already exist — training skip.")
+    print("Model files already exist — checking stats...")
+    try:
+        with open(STATS_PATH) as f:
+            _test = json.load(f)
+        if 'confusion_matrix' not in _test:
+            print("Purani stats — retraining for full stats...")
+            train_and_save_models()
+        else:
+            print("Stats OK — training skip.")
+    except:
+        train_and_save_models()
 
 
-# ─────────────────────────────────────────────
-# MODELS LOAD KARO
-# ─────────────────────────────────────────────
 print("Loading models...")
 model  = joblib.load(gb_path)
 iso    = joblib.load(iso_path)
@@ -126,16 +150,10 @@ _normal_rows = df_full[df_full['Class'] == 0][_feat_cols].values
 print(f"Ready — {len(df_full):,} transactions | fraud pool: {len(_fraud_rows)} | normal pool: {len(_normal_rows)}")
 
 
-# ─────────────────────────────────────────────
-# HELPER
-# ─────────────────────────────────────────────
 def risk_label(p):
     return "HIGH" if p > 0.7 else "MEDIUM" if p > 0.4 else "LOW"
 
 
-# ─────────────────────────────────────────────
-# ROUTES — Bilkul same as before
-# ─────────────────────────────────────────────
 @app.route('/')
 def index():
     return render_template('index.html')
