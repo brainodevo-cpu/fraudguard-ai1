@@ -15,10 +15,97 @@ STATS_PATH = os.path.join(MODEL_DIR, 'model_stats.json')
 
 app = Flask(__name__)
 
+# ─────────────────────────────────────────────
+# AUTO-TRAIN FUNCTION
+# Agar .pkl files nahi hain toh yeh function
+# dataset se model train karke save karega
+# ─────────────────────────────────────────────
+def train_and_save_models():
+    print("=" * 50)
+    print("MODEL FILES NAHI MILE — AUTO TRAINING SHURU...")
+    print("=" * 50)
+
+    from sklearn.ensemble import GradientBoostingClassifier, IsolationForest
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import roc_auc_score
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    print("Dataset load ho raha hai...")
+    df = pd.read_excel(DATA_PATH)
+
+    X = df.drop('Class', axis=1)
+    y = df['Class']
+
+    print("Scaler fit ho raha hai...")
+    scaler = StandardScaler()
+    X_sc = scaler.fit_transform(X)
+
+    print("Isolation Forest train ho raha hai...")
+    iso = IsolationForest(n_estimators=100, contamination=0.02, random_state=42)
+    iso.fit(X_sc)
+    iso_scores = iso.decision_function(X_sc).reshape(-1, 1)
+
+    X_hybrid = np.hstack([X_sc, iso_scores])
+
+    print("Gradient Boosting train ho raha hai (thoda time lagega)...")
+    gb = GradientBoostingClassifier(
+        n_estimators=200,
+        learning_rate=0.1,
+        max_depth=4,
+        random_state=42
+    )
+    gb.fit(X_hybrid, y)
+
+    probs = gb.predict_proba(X_hybrid)[:, 1]
+    preds = (probs >= 0.5).astype(int)
+    auc   = roc_auc_score(y, probs)
+
+    print(f"ROC-AUC: {auc:.4f}")
+
+    # Model stats save karo
+    stats = {
+        "roc_auc":         round(auc * 100, 2),
+        "total_transactions": int(len(df)),
+        "fraud_count":     int(y.sum()),
+        "normal_count":    int((y == 0).sum()),
+        "fraud_pct":       round(float(y.mean()) * 100, 2),
+        "model":           "Gradient Boosting + Isolation Forest",
+        "features":        list(X.columns)
+    }
+
+    print("Models save ho rahe hain...")
+    joblib.dump(gb,     os.path.join(MODEL_DIR, 'gb_model.pkl'))
+    joblib.dump(iso,    os.path.join(MODEL_DIR, 'iso_forest.pkl'))
+    joblib.dump(scaler, os.path.join(MODEL_DIR, 'scaler.pkl'))
+
+    with open(STATS_PATH, 'w') as f:
+        json.dump(stats, f, indent=2)
+
+    print("AUTO TRAINING COMPLETE!")
+    print("=" * 50)
+
+
+# ─────────────────────────────────────────────
+# CHECK KARO — FILES HAIN YA NAHI
+# ─────────────────────────────────────────────
+gb_path  = os.path.join(MODEL_DIR, 'gb_model.pkl')
+iso_path = os.path.join(MODEL_DIR, 'iso_forest.pkl')
+sc_path  = os.path.join(MODEL_DIR, 'scaler.pkl')
+
+if not (os.path.exists(gb_path) and os.path.exists(iso_path) and os.path.exists(sc_path)):
+    train_and_save_models()
+else:
+    print("Model files already exist — training skip.")
+
+
+# ─────────────────────────────────────────────
+# MODELS LOAD KARO
+# ─────────────────────────────────────────────
 print("Loading models...")
-model  = joblib.load(os.path.join(MODEL_DIR, 'gb_model.pkl'))
-iso    = joblib.load(os.path.join(MODEL_DIR, 'iso_forest.pkl'))
-scaler = joblib.load(os.path.join(MODEL_DIR, 'scaler.pkl'))
+model  = joblib.load(gb_path)
+iso    = joblib.load(iso_path)
+scaler = joblib.load(sc_path)
 
 with open(STATS_PATH) as f:
     STATS = json.load(f)
@@ -38,9 +125,17 @@ _normal_rows = df_full[df_full['Class'] == 0][_feat_cols].values
 
 print(f"Ready — {len(df_full):,} transactions | fraud pool: {len(_fraud_rows)} | normal pool: {len(_normal_rows)}")
 
+
+# ─────────────────────────────────────────────
+# HELPER
+# ─────────────────────────────────────────────
 def risk_label(p):
     return "HIGH" if p > 0.7 else "MEDIUM" if p > 0.4 else "LOW"
 
+
+# ─────────────────────────────────────────────
+# ROUTES — Bilkul same as before
+# ─────────────────────────────────────────────
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -55,7 +150,7 @@ def transactions():
     per_page = int(request.args.get('per_page', 20))
     ftype    = request.args.get('type', 'all')
     dff = df_full.copy()
-    if ftype == 'fraud':   dff = dff[dff['Class'] == 1]
+    if ftype == 'fraud':    dff = dff[dff['Class'] == 1]
     elif ftype == 'normal': dff = dff[dff['Class'] == 0]
     total  = len(dff)
     subset = dff.iloc[(page-1)*per_page : page*per_page]
@@ -174,6 +269,5 @@ def time_series():
     return jsonify({"bins": grp['time_bin'].tolist(), "total": grp['total'].tolist(), "fraud": grp['fraud'].tolist()})
 
 if __name__ == '__main__':
-    import os
     port = int(os.environ.get('PORT', 5000))
     app.run(debug=False, host='0.0.0.0', port=port)
